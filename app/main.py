@@ -1,9 +1,12 @@
 """Сервер: принимает аудиопоток звонка от Twilio и параллельно крутит Telegram-бота."""
+import hashlib
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import PlainTextResponse
+from telegram import Update
 
 from . import config as S
 from .call_session import CALLS
@@ -13,15 +16,31 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+WEBHOOK = os.getenv("TELEGRAM_MODE") == "webhook"
+TG = {}
+
+
+def webhook_secret() -> str:
+    return hashlib.sha256(("tg-hook:" + S.get("TELEGRAM_BOT_TOKEN")).encode()).hexdigest()[:40]
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     tg = build_app()
+    TG["app"] = tg
     await tg.initialize()
     await tg.start()
-    await tg.updater.start_polling(drop_pending_updates=True)
-    logging.info("Telegram-бот запущен")
+    if WEBHOOK:
+        # Cloudflare: Telegram сам будит контейнер, присылая сообщения на адрес Worker'а
+        url = S.get("PUBLIC_URL").rstrip("/") + "/tg/" + webhook_secret()
+        await tg.bot.set_webhook(url, secret_token=webhook_secret(), allowed_updates=Update.ALL_TYPES)
+        logging.info("Telegram-бот запущен (webhook)")
+    else:
+        await tg.updater.start_polling(drop_pending_updates=True)
+        logging.info("Telegram-бот запущен (polling)")
     yield
-    await tg.updater.stop()
+    if not WEBHOOK:
+        await tg.updater.stop()
     await tg.stop()
     await tg.shutdown()
 
@@ -30,8 +49,22 @@ api = FastAPI(lifespan=lifespan)
 
 
 @api.get("/")
+async def index():
+    return PlainTextResponse("✅ Бот-звонилка работает. Открой своего бота в Telegram и нажми /start.")
+
+
+@api.get("/health")
 async def health():
-    return PlainTextResponse("callbot ok")
+    return PlainTextResponse("ok")
+
+
+@api.post("/tg/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if secret != webhook_secret() or request.headers.get("x-telegram-bot-api-secret-token") != webhook_secret():
+        return PlainTextResponse("forbidden", status_code=403)
+    tg = TG["app"]
+    await tg.update_queue.put(Update.de_json(await request.json(), tg.bot))
+    return PlainTextResponse("ok")
 
 
 @api.post("/status/{call_id}")
@@ -58,8 +91,6 @@ async def media(ws: WebSocket, call_id: str):
 
 
 def run():
-    import os
-
     import uvicorn
 
     if not S.get("TELEGRAM_BOT_TOKEN"):

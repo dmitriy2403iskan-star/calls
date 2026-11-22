@@ -302,7 +302,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def build_app() -> Application:
-    app = Application.builder().token(S.get("TELEGRAM_BOT_TOKEN")).build()
+    app = Application.builder().token(S.get("TELEGRAM_BOT_TOKEN")).concurrent_updates(True).build()
     app.bot_data["notifier"] = Notifier(app)
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("settings", cmd_settings))

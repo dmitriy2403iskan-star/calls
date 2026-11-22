@@ -28,7 +28,31 @@
 | Twilio | https://twilio.com → Account SID + Auth Token | пробный баланс, дальше поминутно |
 | Сервер с публичным адресом | ngrok на своём компьютере или Railway/VPS | бесплатно / недорого |
 
-## Установка
+## 🚀 Запуск на Cloudflare (всё с телефона)
+
+Бот работает в Cloudflare Containers. Контейнер засыпает, когда им никто не пользуется (за сон деньги не берут),
+и сам просыпается от твоего сообщения в Telegram. Первый ответ после сна приходит через несколько секунд.
+Нужен тариф **Workers Paid** ($5 в месяц).
+
+1. **Тариф.** dash.cloudflare.com → Workers & Pages → Plans → **Workers Paid**.
+2. **Создать Worker из GitHub.** Workers & Pages → **Create** → **Import a repository** → GitHub →
+   разреши доступ → выбери репозиторий `calls` → **Deploy** (команду деплоя оставь `npx wrangler deploy`).
+   Первая сборка идёт несколько минут.
+3. **Токен бота.** Открой Worker `calls` → Settings → **Variables and Secrets** → Add →
+   тип *Secret*, имя `TELEGRAM_BOT_TOKEN`, значение: токен от @BotFather → Deploy.
+4. **Разбудить бота.** Открой в браузере адрес Worker'а (`https://calls.<твой-поддомен>.workers.dev`).
+   Должно появиться «✅ Бот-звонилка работает». Адрес для звонков (`PUBLIC_URL`) бот возьмёт сам.
+5. **Telegram.** Напиши боту `/start` (ты станешь владельцем), потом:
+   - `/set GEMINI_API_KEY …`
+   - `/set TWILIO_ACCOUNT_SID …` и `/set TWILIO_AUTH_TOKEN …`
+   - `/mynumber +380…`, чтобы бот звонил с твоего номера
+   - по желанию `/set OWNER_NAME Имя`
+
+Настройки, заданные через `/set`, сохраняются в Cloudflare и не пропадают, когда контейнер засыпает.
+Любой ключ можно задать и как Secret в дашборде (шаг 3), но значение из `/set` имеет приоритет.
+Каждый `git push` в `main` автоматически пересобирает бота.
+
+## Установка на свой сервер / компьютер
 
 ### 1. Twilio: подключить свой номер
 1. Зарегистрируйся на twilio.com и скопируй **Account SID** и **Auth Token** с главной страницы Console.
@@ -90,3 +114,4 @@ ngrok http 8000             # скопируй https://….ngrok-free.app в PUB
 - `app/call_session.py`: сам звонок: мост Twilio ↔ Gemini, инструменты `ask_owner` / `end_call`, промпт
 - `app/audio.py`: перекодирование звука (μ-law 8 кГц ↔ PCM 16/24 кГц)
 - `app/config.py`: настройки (.env + изменения из Telegram)
+- `worker/index.js`, `wrangler.jsonc`: обёртка для Cloudflare Containers

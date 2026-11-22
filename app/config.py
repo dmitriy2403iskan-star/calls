@@ -36,12 +36,34 @@ _lock = threading.Lock()
 
 
 def _load() -> dict:
+    data = {}
+    # в Cloudflare настройки хранятся в Durable Object и приходят при старте контейнера
+    try:
+        data.update(json.loads(os.getenv("SETTINGS_JSON") or "{}"))
+    except Exception:
+        pass
     if SETTINGS_FILE.exists():
         try:
-            return json.loads(SETTINGS_FILE.read_text("utf-8"))
+            data.update(json.loads(SETTINGS_FILE.read_text("utf-8")))
         except Exception:
-            return {}
-    return {}
+            pass
+    return data
+
+
+def _push_remote(payload: str) -> None:
+    url, token = os.getenv("SETTINGS_SYNC_URL"), os.getenv("INTERNAL_TOKEN")
+    if not url or not token:
+        return
+    import urllib.request
+
+    req = urllib.request.Request(
+        url, data=payload.encode(), method="PUT",
+        headers={"x-internal-token": token, "content-type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=15).read()
+    except Exception as e:  # не страшно: настройка всё равно действует до сна контейнера
+        print("settings sync failed:", e)
 
 
 _overrides = _load()
@@ -67,7 +89,9 @@ def set(key: str, value: str) -> None:  # noqa: A001
             _overrides.pop(key, None)
         else:
             _overrides[key] = value
-        SETTINGS_FILE.write_text(json.dumps(_overrides, ensure_ascii=False, indent=2), "utf-8")
+        payload = json.dumps(_overrides, ensure_ascii=False, indent=2)
+        SETTINGS_FILE.write_text(payload, "utf-8")
+    threading.Thread(target=_push_remote, args=(payload,), daemon=True).start()
 
 
 def mask(value: str) -> str:

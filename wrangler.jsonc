@@ -1,0 +1,21 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "calls",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-11-09",
+  "observability": { "enabled": true },
+  "containers": [
+    {
+      "class_name": "BotContainer",
+      "image": "./Dockerfile",
+      "instance_type": "basic",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "BOT", "class_name": "BotContainer" }]
+  },
+  "exports": {
+    "BotContainer": { "type": "durable-object", "storage": "sqlite" }
+  }
+}
