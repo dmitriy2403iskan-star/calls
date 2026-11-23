@@ -29,6 +29,19 @@ async def lifespan(_: FastAPI):
     tg = build_app()
     TG["app"] = tg
     await tg.initialize()
+    from . import store
+
+    await store.bootstrap(tg.bot)  # владелец и общие настройки из Telegram
+    try:
+        from telegram import BotCommand
+
+        await tg.bot.set_my_commands([
+            BotCommand("start", "Помощь"), BotCommand("key", "Свой ключ Gemini"),
+            BotCommand("mynumber", "Звонить с моего номера"), BotCommand("settings", "Мои настройки"),
+            BotCommand("hangup", "Положить трубку"),
+        ])
+    except Exception:
+        pass
     await tg.start()
     if WEBHOOK:
         # Cloudflare: Telegram сам будит контейнер, присылая сообщения на адрес Worker'а

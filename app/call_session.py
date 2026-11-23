@@ -18,13 +18,15 @@ log = logging.getLogger("call")
 CALLS: dict[str, "CallSession"] = {}
 
 
-def twilio_client() -> TwilioClient:
-    return TwilioClient(S.get("TWILIO_ACCOUNT_SID"), S.get("TWILIO_AUTH_TOKEN"))
+def twilio_client(cfg=None) -> TwilioClient:
+    cfg = cfg or S
+    return TwilioClient(cfg.get("TWILIO_ACCOUNT_SID"), cfg.get("TWILIO_AUTH_TOKEN"))
 
 
-def build_prompt(task: str, number: str) -> str:
-    owner = S.get("OWNER_NAME") or "мой владелец"
-    timeout = S.get_int("ASK_TIMEOUT")
+def build_prompt(task: str, number: str, cfg=None) -> str:
+    cfg = cfg or S
+    owner = cfg.get("OWNER_NAME") or "мой владелец"
+    timeout = cfg.get_int("ASK_TIMEOUT")
     return f"""Ты — голосовой ассистент, который сам ведёт телефонный звонок от имени человека по имени {owner}.
 Ты звонишь на номер {number}. Собеседник на том конце — живой человек (администратор, менеджер, оператор и т.п.) или автоответчик.
 
@@ -33,7 +35,7 @@ def build_prompt(task: str, number: str) -> str:
 
 КАК ВЕСТИ РАЗГОВОР:
 - Говори естественно, вежливо и коротко, как обычный человек по телефону. Одна-две фразы за раз, не читай лекций.
-- Язык по умолчанию: {S.get("LANGUAGE")}. Если собеседник говорит на другом языке (например, украинском) — переходи на его язык.
+- Язык по умолчанию: {cfg.get("LANGUAGE")}. Если собеседник говорит на другом языке (например, украинском) — переходи на его язык.
 - Когда собеседник ответил («алло», «слушаю»), поздоровайся, скажи, что звонишь от имени {owner}, и сразу переходи к делу.
 - Внимательно слушай и добивайся цели. Если что-то не получается — ищи альтернативы (другое время, другая дата, другой вариант), которые разумно подходят под задачу.
 - Используй только данные из задачи. Не выдумывай телефоны, адреса, номера карт, имена и прочие факты. Платёжные данные и пароли никогда не называй.
@@ -101,8 +103,10 @@ TOOLS = [
 
 
 class CallSession:
-    def __init__(self, number: str, task: str, notifier):
+    def __init__(self, number: str, task: str, notifier, cfg=None, user_id: int | None = None):
         self.id = uuid.uuid4().hex
+        self.cfg = cfg or S  # настройки того, кто заказал звонок
+        self.user_id = user_id
         self.number = number
         self.task = task
         self.notifier = notifier
@@ -129,13 +133,13 @@ class CallSession:
         twiml = f'<Response><Connect><Stream url="{ws_url}"/></Connect></Response>'
         params = dict(
             to=self.number,
-            from_=S.get("TWILIO_FROM_NUMBER"),
+            from_=self.cfg.get("TWILIO_FROM_NUMBER"),
             twiml=twiml,
             time_limit=S.get_int("MAX_CALL_SECONDS"),
             status_callback=f"{base}/status/{self.id}",
             status_callback_event=["initiated", "ringing", "answered", "completed"],
         )
-        call = await asyncio.to_thread(lambda: twilio_client().calls.create(**params))
+        call = await asyncio.to_thread(lambda: twilio_client(self.cfg).calls.create(**params))
         self.twilio_sid = call.sid
 
     async def hangup(self) -> None:
@@ -143,7 +147,7 @@ class CallSession:
             return
         try:
             await asyncio.to_thread(
-                lambda: twilio_client().calls(self.twilio_sid).update(status="completed")
+                lambda: twilio_client(self.cfg).calls(self.twilio_sid).update(status="completed")
             )
         except Exception as e:  # звонок уже мог завершиться
             log.info("hangup: %s", e)
@@ -152,13 +156,13 @@ class CallSession:
     async def run(self, ws) -> None:
         self.ws = ws
         self.status = "in-progress"
-        client = genai.Client(api_key=S.get("GEMINI_API_KEY"))
+        client = genai.Client(api_key=self.cfg.get("GEMINI_API_KEY"))
         cfg = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
-            system_instruction=build_prompt(self.task, self.number),
+            system_instruction=build_prompt(self.task, self.number, self.cfg),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=S.get("GEMINI_VOICE"))
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=self.cfg.get("GEMINI_VOICE"))
                 )
             ),
             tools=TOOLS,
@@ -166,7 +170,7 @@ class CallSession:
             output_audio_transcription=types.AudioTranscriptionConfig(),
         )
         try:
-            async with client.aio.live.connect(model=S.get("GEMINI_MODEL"), config=cfg) as session:
+            async with client.aio.live.connect(model=self.cfg.get("GEMINI_MODEL"), config=cfg) as session:
                 tasks = [
                     asyncio.create_task(self._from_phone(session)),
                     asyncio.create_task(self._from_gemini(session)),
@@ -279,7 +283,7 @@ class CallSession:
         qid = uuid.uuid4().hex[:8]
         fut = asyncio.get_running_loop().create_future()
         self.pending[qid] = (fut, options)
-        timeout = S.get_int("ASK_TIMEOUT")
+        timeout = self.cfg.get_int("ASK_TIMEOUT")
         await self.notifier.question(self, qid, question, options, timeout)
         try:
             answer = await asyncio.wait_for(fut, timeout)
@@ -316,7 +320,7 @@ class CallSession:
         if not text:
             return
         self.transcript.append((who, text))
-        if S.get("LIVE_TRANSCRIPT") == "1":
+        if self.cfg.get("LIVE_TRANSCRIPT") == "1":
             icon = "👤" if who == "callee" else "🤖"
             await self.notifier.text(f"{icon} {escape(text)}", silent=True)
 

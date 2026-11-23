@@ -1,4 +1,5 @@
-"""Telegram-пульт: даёшь номер и задачу — бот звонит, присылает вопросы и итог."""
+"""Telegram-пульт: даёшь номер и задачу — бот звонит, присылает вопросы и итог.
+У каждого пользователя свои ключи (Gemini, Twilio) и свой номер."""
 import asyncio
 import logging
 import re
@@ -17,58 +18,134 @@ from telegram.ext import (
 )
 
 from . import config as S
-from .call_session import CALLS, CallSession
+from . import store
+from .call_session import CALLS, CallSession, twilio_client
 
 log = logging.getLogger("tg")
 
 HELP = """<b>Бот-звонилка</b> 📞
 
-Просто напиши номер и задачу одним сообщением:
+<b>1. Задай свой ключ Gemini</b> (бесплатно на aistudio.google.com/apikey):
+<code>/key AIza…</code>
+
+<b>2. Звонок</b> — номер и задача одним сообщением:
 <code>+380671234567 Забронируй столик на двоих на завтра на 19:00 на имя Алексей. Лучше у окна.</code>
 
 Во время звонка:
 • бот присылает, что говорят обе стороны;
 • если нужен выбор — придут кнопки. Не ответишь за {timeout} сек — бот решит сам;
-• любое твоё сообщение во время звонка бот получит как подсказку («скажи, что будем вчетвером»);
+• любое твоё сообщение во время звонка — подсказка боту («скажи, что будем вчетвером»);
 • /hangup — положить трубку.
 
-Свой номер:
-/mynumber +380XXXXXXXXX — привязать твой мобильный, чтобы бот звонил с него
-
-Настройки:
-/settings — показать все настройки
-/set КЛЮЧ значение — поменять (например <code>/set GEMINI_API_KEY AIza…</code>)
-/set КЛЮЧ — сбросить на значение из .env
+<b>Свои настройки</b> (видны только тебе):
+/key AIza… — свой ключ Gemini
+/mynumber +380… — звонить с твоего номера
+/settings — показать настройки
+/set КЛЮЧ значение — поменять (например <code>/set GEMINI_VOICE Kore</code>)
 Сообщения с ключами бот сразу удаляет из чата."""
 
+OWNER_HELP = """
+
+<b>Для владельца:</b>
+/access open|closed — пускать всех или только разрешённых
+/allow ID, /deny ID, /users — список доступа
+/set SHARE_TWILIO 1 — разрешить другим звонить через твой Twilio (платишь ты)"""
+
 PHONE_RE = re.compile(r"(\+?\(?\d[\d\s\-()]{7,}\d)")
+SECRET_KEYS = {k for k, v in S.DEFAULTS.items() if v[2]}
 
 
-def normalize_number(raw: str) -> str:
+# ---------- пользователи и их настройки ----------
+def owner_id() -> int | None:
+    o = S.get("TELEGRAM_OWNER_ID")
+    return int(o) if o else None
+
+
+def is_owner(uid: int) -> bool:
+    return owner_id() == uid
+
+
+def allowed(uid: int) -> bool:
+    if is_owner(uid) or S.get("ACCESS") == "open":
+        return True
+    return str(uid) in [x.strip() for x in S.get("ALLOWED_USERS").split(",") if x.strip()]
+
+
+class Profile:
+    """Настройки конкретного пользователя: его значения → (для владельца или общих полей) значения владельца."""
+
+    def __init__(self, uid: int, data: dict):
+        self.uid = uid
+        self.data = data
+
+    def get(self, key: str) -> str:
+        if is_owner(self.uid):
+            return S.get(key)
+        val = (self.data.get("profile") or {}).get(key, "")
+        if val:
+            return val
+        if key in S.PRIVATE_KEYS:
+            if key in ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN") and S.get("SHARE_TWILIO") == "1":
+                return S.get(key)
+            return ""
+        return S.get(key)
+
+    def get_int(self, key: str) -> int:
+        try:
+            return int(float(self.get(key)))
+        except ValueError:
+            return int(S.DEFAULTS[key][0])
+
+
+async def profile(ctx: ContextTypes.DEFAULT_TYPE, uid: int) -> Profile:
+    return Profile(uid, await store.load(ctx.bot, uid))
+
+
+async def set_value(ctx: ContextTypes.DEFAULT_TYPE, uid: int, key: str, value: str) -> None:
+    """Владелец меняет общие настройки, остальные — только свои."""
+    if is_owner(uid):
+        S.set(key, value)
+        await store.save_global(ctx.bot)
+        return
+    data = dict(await store.load(ctx.bot, uid))
+    prof = dict(data.get("profile") or {})
+    if value:
+        prof[key] = value
+    else:
+        prof.pop(key, None)
+    data["profile"] = prof
+    await store.save(ctx.bot, uid, data)
+
+
+def normalize_number(raw: str, cc: str | None = None) -> str:
     digits = re.sub(r"[^\d+]", "", raw)
     if digits.startswith("+"):
         return digits
     if digits.startswith("00"):
         return "+" + digits[2:]
-    cc = S.get("DEFAULT_COUNTRY_CODE")
+    cc = cc if cc is not None else S.get("DEFAULT_COUNTRY_CODE")
     if digits.startswith("0"):
         return f"+{cc}{digits[1:]}"
-    if cc and digits.startswith(cc):
-        return "+" + digits
     return "+" + digits
 
 
-def active_calls() -> list[CallSession]:
-    return [c for c in CALLS.values() if not c.finished]
+def active_calls(uid: int | None = None) -> list[CallSession]:
+    return [c for c in CALLS.values() if not c.finished and (uid is None or c.user_id == uid)]
 
 
+async def _delete(update: Update) -> None:
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+
+# ---------- уведомления о звонке ----------
 class Notifier:
-    def __init__(self, app: Application):
+    def __init__(self, app: Application, chat_id: int, cfg):
         self.app = app
-
-    @property
-    def chat_id(self) -> int:
-        return int(S.get("TELEGRAM_OWNER_ID"))
+        self.chat_id = chat_id
+        self.cfg = cfg
 
     async def text(self, html: str, silent: bool = False, buttons=None):
         return await self.app.bot.send_message(
@@ -79,138 +156,218 @@ class Notifier:
         rows = [[InlineKeyboardButton(o[:60], callback_data=f"a|{call.id[:12]}|{qid}|{i}")] for i, o in enumerate(options)]
         rows.append([InlineKeyboardButton("🤖 Реши сам", callback_data=f"a|{call.id[:12]}|{qid}|auto")])
         await self.text(
-            f"❓ <b>{escape(question)}</b>\n\nВыбери вариант или ответь текстом. "
-            f"Через {timeout} сек бот решит сам.",
+            f"❓ <b>{escape(question)}</b>\n\nВыбери вариант или ответь текстом. Через {timeout} сек бот решит сам.",
             buttons=InlineKeyboardMarkup(rows),
         )
 
     async def call_finished(self, call: CallSession):
-        names = {
-            "busy": "📵 Занято",
-            "no-answer": "📵 Не взяли трубку",
-            "failed": "❌ Звонок не прошёл",
-            "canceled": "❌ Звонок отменён",
-        }
+        names = {"busy": "📵 Занято", "no-answer": "📵 Не взяли трубку", "failed": "❌ Звонок не прошёл", "canceled": "❌ Звонок отменён"}
         icons = {"success": "✅ Готово", "partial": "🟡 Частично", "failed": "❌ Не получилось", "voicemail": "📼 Автоответчик"}
         dur = int(time.time() - call.started_at)
-        if call.status in names and not call.transcript:
-            head = names[call.status]
-        else:
-            head = icons.get(call.outcome or "", "📞 Звонок завершён")
+        head = names[call.status] if call.status in names and not call.transcript else icons.get(call.outcome or "", "📞 Звонок завершён")
         msg = f"{head} — <code>{call.number}</code> ({dur // 60}:{dur % 60:02d})\n\n"
         if call.summary:
             msg += f"<b>Итог:</b> {escape(call.summary)}"
         elif call.transcript:
             msg += "<i>Бот не успел подвести итог. Расшифровка ниже.</i>"
         await self.text(msg)
-        if call.transcript and S.get("LIVE_TRANSCRIPT") != "1":
+        if call.transcript and self.cfg.get("LIVE_TRANSCRIPT") != "1":
             body = escape(call.transcript_text())
             for i in range(0, len(body), 3800):
                 await self.text(f"<pre>{body[i:i + 3800]}</pre>", silent=True)
 
 
-def is_owner(update: Update) -> bool:
-    owner = S.get("TELEGRAM_OWNER_ID")
-    return bool(owner) and str(update.effective_user.id) == owner
-
-
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not S.get("TELEGRAM_OWNER_ID"):
-        S.set("TELEGRAM_OWNER_ID", str(update.effective_user.id))
-        msg = "Ты записан как владелец бота. Чужие сообщения бот будет игнорировать."
-        if S.EPHEMERAL:
-            msg += f"\n\nЧтобы это не сбрасывалось, добавь в Render → Environment: TELEGRAM_OWNER_ID = {update.effective_user.id}"
-        await update.message.reply_text(msg)
-    if not is_owner(update):
-        return
-    await update.message.reply_text(HELP.format(timeout=S.get_int("ASK_TIMEOUT")), parse_mode=ParseMode.HTML)
-    missing = [k for k in ("GEMINI_API_KEY", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER", "PUBLIC_URL") if not S.get(k)]
-    if missing:
+# ---------- доступ ----------
+async def gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    uid = update.effective_user.id
+    if allowed(uid):
+        return True
+    if update.message:
         await update.message.reply_text(
-            "⚠️ Ещё не заданы: " + ", ".join(missing) + "\nЗадай через /set КЛЮЧ значение"
-            + (" (номер — через /mynumber +380…)" if "TWILIO_FROM_NUMBER" in missing else "") + "."
+            f"🔒 Доступ к боту закрыт. Твой ID: <code>{uid}</code>\nЯ отправил владельцу запрос.",
+            parse_mode=ParseMode.HTML,
         )
+        oid = owner_id()
+        if oid and not ctx.bot_data.setdefault("asked", set()).__contains__(uid):
+            ctx.bot_data["asked"].add(uid)
+            u = update.effective_user
+            name = escape(" ".join(x for x in [u.first_name, u.last_name] if x) + (f" (@{u.username})" if u.username else ""))
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Разрешить", callback_data=f"allow|{uid}")]])
+            await ctx.bot.send_message(oid, f"🙋 {name} (ID <code>{uid}</code>) просит доступ к боту.", parse_mode=ParseMode.HTML, reply_markup=kb)
+    return False
+
+
+# ---------- команды ----------
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not owner_id():
+        S.set("TELEGRAM_OWNER_ID", str(uid))
+        await store.write_owner(ctx.bot, uid)
+        await store.save_global(ctx.bot)
+        await update.message.reply_text("👑 Ты владелец бота. Другие пользователи смогут войти только с твоего разрешения.")
+    if not await gate(update, ctx):
+        return
+    p = await profile(ctx, uid)
+    text = HELP.format(timeout=p.get_int("ASK_TIMEOUT")) + (OWNER_HELP if is_owner(uid) else "")
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    missing = missing_for_call(p)
+    if missing:
+        await update.message.reply_text("⚠️ Чтобы звонить, не хватает: " + ", ".join(missing))
+
+
+def missing_for_call(p: Profile) -> list[str]:
+    need = {
+        "GEMINI_API_KEY": "ключа Gemini (/key AIza…)",
+        "TWILIO_ACCOUNT_SID": "Twilio SID (/set TWILIO_ACCOUNT_SID …)",
+        "TWILIO_AUTH_TOKEN": "Twilio токена (/set TWILIO_AUTH_TOKEN …)",
+        "TWILIO_FROM_NUMBER": "номера (/mynumber +380…)",
+    }
+    out = [v for k, v in need.items() if not p.get(k)]
+    if not S.get("PUBLIC_URL"):
+        out.append("PUBLIC_URL сервера (настраивает владелец)")
+    return out
+
+
+async def cmd_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await gate(update, ctx):
+        return
+    uid = update.effective_user.id
+    if not ctx.args:
+        p = await profile(ctx, uid)
+        await update.message.reply_text(
+            f"Твой ключ Gemini: {S.mask(p.get('GEMINI_API_KEY'))}\n\nПоменять: /key AIza…\nУдалить: /key -",
+        )
+        return
+    value = "" if ctx.args[0] == "-" else ctx.args[0].strip()
+    await _delete(update)
+    if value and not value.startswith("AIza"):
+        await ctx.bot.send_message(update.effective_chat.id, "⚠️ Похоже, это не ключ Gemini (он начинается с AIza). Сохраняю как есть.")
+    await set_value(ctx, uid, "GEMINI_API_KEY", value)
+    await ctx.bot.send_message(update.effective_chat.id, f"✅ Твой ключ Gemini: {S.mask(value) if value else 'удалён'}")
 
 
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if is_owner(update):
-        await update.message.reply_text(S.describe(), parse_mode=ParseMode.HTML)
+    if not await gate(update, ctx):
+        return
+    uid = update.effective_user.id
+    p = await profile(ctx, uid)
+    keys = None if is_owner(uid) else S.PERSONAL_KEYS
+    await update.message.reply_text(S.describe(keys, p.get), parse_mode=ParseMode.HTML)
 
 
 async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if not await gate(update, ctx):
         return
+    uid = update.effective_user.id
     if not ctx.args:
         await update.message.reply_text("Формат: /set КЛЮЧ значение. Список ключей — /settings")
         return
     key = ctx.args[0].upper()
     value = " ".join(ctx.args[1:]).strip()
-    if key not in S.DEFAULTS or key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID"):
-        await update.message.reply_text("Такой ключ нельзя менять отсюда. Список — /settings")
+    allowed_keys = [k for k in S.DEFAULTS if k not in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID")] if is_owner(uid) else S.PERSONAL_KEYS
+    if key not in allowed_keys:
+        await update.message.reply_text("Такой ключ тебе менять нельзя. Список — /settings")
         return
-    S.set(key, value)
-    secret = S.DEFAULTS[key][2]
-    if secret:
+    if key in SECRET_KEYS:
+        await _delete(update)
+    await set_value(ctx, uid, key, value)
+    shown = S.mask(value) if key in SECRET_KEYS else (value or "сброшено")
+    await ctx.bot.send_message(update.effective_chat.id, f"✅ {key} = {shown}")
+
+
+async def cmd_access(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        return
+    mode = (ctx.args[0].lower() if ctx.args else "")
+    if mode not in ("open", "closed"):
+        await update.message.reply_text(f"Сейчас доступ: {S.get('ACCESS')}\n/access open — всем\n/access closed — только разрешённым")
+        return
+    await set_value(ctx, uid, "ACCESS", mode)
+    await update.message.reply_text("🔓 Бот открыт для всех." if mode == "open" else "🔒 Только для разрешённых.")
+
+
+def _allowed_list() -> list[str]:
+    return [x.strip() for x in S.get("ALLOWED_USERS").split(",") if x.strip()]
+
+
+async def _allow(ctx, target: str, add: bool) -> None:
+    ids = _allowed_list()
+    if add and target not in ids:
+        ids.append(target)
+    if not add:
+        ids = [x for x in ids if x != target]
+    await set_value(ctx, owner_id(), "ALLOWED_USERS", ",".join(ids))
+
+
+async def cmd_allow(update: Update, ctx: ContextTypes.DEFAULT_TYPE, add: bool = True):
+    if not is_owner(update.effective_user.id):
+        return
+    if not ctx.args or not ctx.args[0].isdigit():
+        await update.message.reply_text(f"Формат: /{'allow' if add else 'deny'} ID")
+        return
+    await _allow(ctx, ctx.args[0], add)
+    await update.message.reply_text(("✅ Доступ выдан: " if add else "🚫 Доступ закрыт: ") + ctx.args[0])
+    if add:
         try:
-            await update.message.delete()
+            await ctx.bot.send_message(int(ctx.args[0]), "✅ Владелец открыл тебе доступ. Нажми /start")
         except Exception:
             pass
-    shown = S.mask(value) if secret else (value or "сброшено")
-    note = ""
-    if S.EPHEMERAL:
-        note = ("\n\nℹ️ На Render настройка действует до сна сервера. Чтобы сохранить навсегда, "
-                f"добавь {key} в Render → Environment.")
-    await ctx.bot.send_message(update.effective_chat.id, f"✅ {key} = {shown}{note}")
 
 
-def _is_verified(number: str) -> bool:
-    from .call_session import twilio_client
+async def cmd_deny(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await cmd_allow(update, ctx, add=False)
 
-    return bool(twilio_client().outgoing_caller_ids.list(phone_number=number, limit=1))
+
+async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+    ids = _allowed_list()
+    await update.message.reply_text(
+        f"Доступ: {S.get('ACCESS')}\nРазрешены: " + (", ".join(ids) if ids else "никто, кроме тебя")
+    )
+
+
+def _is_verified(cfg, number: str) -> bool:
+    return bool(twilio_client(cfg).outgoing_caller_ids.list(phone_number=number, limit=1))
 
 
 async def cmd_mynumber(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Привязать свой мобильный: Twilio звонит тебе, ты вводишь код — и бот звонит с твоим номером."""
-    if not is_owner(update):
+    if not await gate(update, ctx):
         return
-    if not (S.get("TWILIO_ACCOUNT_SID") and S.get("TWILIO_AUTH_TOKEN")):
-        await update.message.reply_text("Сначала задай TWILIO_ACCOUNT_SID и TWILIO_AUTH_TOKEN через /set.")
+    uid = update.effective_user.id
+    p = await profile(ctx, uid)
+    if not (p.get("TWILIO_ACCOUNT_SID") and p.get("TWILIO_AUTH_TOKEN")):
+        await update.message.reply_text("Сначала задай свои TWILIO_ACCOUNT_SID и TWILIO_AUTH_TOKEN через /set.")
         return
     if not ctx.args:
-        cur = S.get("TWILIO_FROM_NUMBER") or "не задан"
-        await update.message.reply_text(
-            f"Сейчас бот звонит с номера: {cur}\n\nЧтобы звонил с твоего: /mynumber +380XXXXXXXXX"
-        )
+        cur = p.get("TWILIO_FROM_NUMBER") or "не задан"
+        await update.message.reply_text(f"Сейчас бот звонит с номера: {cur}\n\nЧтобы звонил с твоего: /mynumber +380XXXXXXXXX")
         return
-    number = normalize_number("".join(ctx.args))
-    from .call_session import twilio_client
-
-    if await asyncio.to_thread(_is_verified, number):
-        S.set("TWILIO_FROM_NUMBER", number)
+    number = normalize_number("".join(ctx.args), p.get("DEFAULT_COUNTRY_CODE"))
+    if await asyncio.to_thread(_is_verified, p, number):
+        await set_value(ctx, uid, "TWILIO_FROM_NUMBER", number)
         await update.message.reply_text(f"✅ Номер {number} уже подтверждён. Теперь бот звонит с него.")
         return
     try:
         req = await asyncio.to_thread(
-            lambda: twilio_client().validation_requests.create(phone_number=number, friendly_name="callbot", call_delay=5)
+            lambda: twilio_client(p).validation_requests.create(phone_number=number, friendly_name="callbot", call_delay=5)
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Twilio не принял номер: {e}")
         return
     await update.message.reply_text(
         f"📲 Через несколько секунд Twilio позвонит на {number}.\n"
-        f"Возьми трубку и введи на клавиатуре код: <b>{req.validation_code}</b>\n\n"
-        "Я сам проверю, когда номер подтвердится.",
+        f"Возьми трубку и введи на клавиатуре код: <b>{req.validation_code}</b>\n\nЯ сам проверю, когда номер подтвердится.",
         parse_mode=ParseMode.HTML,
     )
     for _ in range(36):  # ждём до 3 минут
         await asyncio.sleep(5)
         try:
-            if await asyncio.to_thread(_is_verified, number):
-                S.set("TWILIO_FROM_NUMBER", number)
-                extra = f"\n\nДобавь в Render → Environment: TWILIO_FROM_NUMBER = {number}" if S.EPHEMERAL else ""
-                await update.message.reply_text(
-                    f"✅ Готово! Номер {number} подтверждён. Теперь у всех, кому звонит бот, высвечивается твой номер.{extra}"
-                )
+            if await asyncio.to_thread(_is_verified, p, number):
+                await set_value(ctx, uid, "TWILIO_FROM_NUMBER", number)
+                await update.message.reply_text(f"✅ Готово! Номер {number} подтверждён. Теперь бот звонит с твоего номера.")
                 return
         except Exception:
             pass
@@ -218,19 +375,20 @@ async def cmd_mynumber(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_hangup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if not await gate(update, ctx):
         return
-    calls = active_calls()
+    calls = active_calls(update.effective_user.id)
     for c in calls:
         await c.hangup()
     await update.message.reply_text("Кладу трубку." if calls else "Сейчас нет активных звонков.")
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if not await gate(update, ctx):
         return
+    uid = update.effective_user.id
     text = update.message.text.strip()
-    calls = active_calls()
+    calls = active_calls(uid)
 
     # 1) ответ на открытый вопрос
     for c in reversed(calls):
@@ -245,7 +403,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not task:
             await update.message.reply_text("Напиши ещё, что нужно сделать в этом звонке.")
             return
-        await start_call(update, ctx, normalize_number(m.group(1)), task)
+        p = await profile(ctx, uid)
+        await start_call(update, ctx, p, normalize_number(m.group(1), p.get("DEFAULT_COUNTRY_CODE")), task)
         return
 
     # 3) подсказка в идущий звонок
@@ -257,17 +416,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Не нашёл номер. Пример:\n+380671234567 Узнай, работают ли они в воскресенье.")
 
 
-async def start_call(update: Update, ctx: ContextTypes.DEFAULT_TYPE, number: str, task: str):
-    missing = [k for k in ("GEMINI_API_KEY", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER", "PUBLIC_URL") if not S.get(k)]
+async def start_call(update: Update, ctx: ContextTypes.DEFAULT_TYPE, p: Profile, number: str, task: str):
+    missing = missing_for_call(p)
     if missing:
         await update.message.reply_text("⚠️ Сначала задай: " + ", ".join(missing))
         return
-    call = CallSession(number, task, ctx.application.bot_data["notifier"])
+    notifier = Notifier(ctx.application, update.effective_chat.id, p)
+    call = CallSession(number, task, notifier, cfg=p, user_id=p.uid)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Положить трубку", callback_data=f"h|{call.id[:12]}")]])
     await update.message.reply_text(
-        f"📞 Звоню на <code>{number}</code>\n<b>Задача:</b> {escape(task)}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
+        f"📞 Звоню на <code>{number}</code>\n<b>Задача:</b> {escape(task)}", parse_mode=ParseMode.HTML, reply_markup=kb
     )
     try:
         await call.dial()
@@ -283,19 +441,32 @@ def _find(prefix: str) -> CallSession | None:
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not is_owner(update):
-        await q.answer()
-        return
+    uid = update.effective_user.id
     parts = q.data.split("|")
+    if parts[0] == "allow":
+        if is_owner(uid):
+            await _allow(ctx, parts[1], True)
+            await q.answer("Доступ выдан")
+            await q.edit_message_text(q.message.text_html + "\n\n✅ Разрешено", parse_mode=ParseMode.HTML)
+            try:
+                await ctx.bot.send_message(int(parts[1]), "✅ Владелец открыл тебе доступ. Нажми /start")
+            except Exception:
+                pass
+        else:
+            await q.answer()
+        return
     call = _find(parts[1])
+    if not call or call.user_id != uid:
+        await q.answer("Звонок уже завершён")
+        return
     if parts[0] == "h":
-        if call and not call.finished:
+        if not call.finished:
             await call.hangup()
             await q.answer("Кладу трубку")
         else:
             await q.answer("Звонок уже завершён")
         return
-    if parts[0] == "a" and call:
+    if parts[0] == "a":
         qid, idx = parts[2], parts[3]
         item = call.pending.get(qid)
         if not item:
@@ -311,10 +482,14 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def build_app() -> Application:
     app = Application.builder().token(S.get("TELEGRAM_BOT_TOKEN")).concurrent_updates(True).build()
-    app.bot_data["notifier"] = Notifier(app)
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CommandHandler("key", cmd_key))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("set", cmd_set))
+    app.add_handler(CommandHandler("access", cmd_access))
+    app.add_handler(CommandHandler("allow", cmd_allow))
+    app.add_handler(CommandHandler("deny", cmd_deny))
+    app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("hangup", cmd_hangup))
     app.add_handler(CommandHandler("mynumber", cmd_mynumber, block=False))
     app.add_handler(CallbackQueryHandler(on_button))

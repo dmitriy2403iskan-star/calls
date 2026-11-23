@@ -6,3 +6,4 @@ twilio>=9.0
 numpy>=1.26
 python-dotenv>=1.0
 python-multipart>=0.0.9
+cryptography>=42

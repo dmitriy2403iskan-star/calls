@@ -30,7 +30,18 @@ DEFAULTS = {
     "MAX_CALL_SECONDS": ("600", "максимальная длина звонка", False),
     "DEFAULT_COUNTRY_CODE": ("380", "код страны для номеров вида 067…", False),
     "LIVE_TRANSCRIPT": ("1", "1 — присылать реплики разговора в чат вживую, 0 — только итог", False),
+    "ACCESS": ("closed", "кто может пользоваться ботом: closed — только разрешённые, open — все", False),
+    "ALLOWED_USERS": ("", "ID пользователей через запятую (управляется /allow и /deny)", False),
+    "SHARE_TWILIO": ("0", "1 — другие пользователи звонят через твой Twilio (оплачиваешь ты)", False),
 }
+
+# что каждый пользователь настраивает сам для себя
+PERSONAL_KEYS = [
+    "GEMINI_API_KEY", "GEMINI_VOICE", "GEMINI_MODEL", "OWNER_NAME", "LANGUAGE", "ASK_TIMEOUT",
+    "LIVE_TRANSCRIPT", "DEFAULT_COUNTRY_CODE", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER",
+]
+# эти значения никогда не берутся у владельца (кроме Twilio при SHARE_TWILIO=1)
+PRIVATE_KEYS = {"GEMINI_API_KEY", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER"}
 
 _lock = threading.Lock()
 
@@ -79,8 +90,21 @@ def get(key: str) -> str:
     return val
 
 
-# на Render диск стирается, когда сервер засыпает
-EPHEMERAL = bool(os.getenv("RENDER"))
+def merge(values: dict) -> None:
+    """Подставить значения в память (и локальный файл) без отправки наружу."""
+    with _lock:
+        for k, v in values.items():
+            if v != "":
+                _overrides[k] = str(v)
+        try:
+            SETTINGS_FILE.write_text(json.dumps(_overrides, ensure_ascii=False, indent=2), "utf-8")
+        except Exception:
+            pass
+
+
+def overrides_copy() -> dict:
+    with _lock:
+        return dict(_overrides)
 
 
 def get_int(key: str) -> int:
@@ -107,10 +131,13 @@ def mask(value: str) -> str:
     return value[:4] + "…" + value[-3:] if len(value) > 10 else "***"
 
 
-def describe() -> str:
+def describe(keys=None, getter=None) -> str:
     lines = []
+    getter = getter or get
     for key, (_, desc, secret) in DEFAULTS.items():
-        val = get(key)
+        if keys is not None and key not in keys:
+            continue
+        val = getter(key)
         shown = mask(val) if secret else (val or "— не задан —")
         lines.append(f"• <code>{key}</code> = {shown}\n   <i>{desc}</i>")
     return "\n".join(lines)
