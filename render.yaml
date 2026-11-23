@@ -1,0 +1,25 @@
+# Render Blueprint: бесплатный сервер (засыпает через 15 мин без дела, просыпается от сообщения в Telegram)
+services:
+  - type: web
+    name: calls-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: TELEGRAM_MODE
+        value: webhook
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_FROM_NUMBER
+        sync: false
+      - key: OWNER_NAME
+        sync: false
+      - key: TELEGRAM_OWNER_ID
+        sync: false

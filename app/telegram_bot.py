@@ -117,7 +117,10 @@ def is_owner(update: Update) -> bool:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not S.get("TELEGRAM_OWNER_ID"):
         S.set("TELEGRAM_OWNER_ID", str(update.effective_user.id))
-        await update.message.reply_text("Ты записан как владелец бота. Чужие сообщения бот будет игнорировать.")
+        msg = "Ты записан как владелец бота. Чужие сообщения бот будет игнорировать."
+        if S.EPHEMERAL:
+            msg += f"\n\nЧтобы это не сбрасывалось, добавь в Render → Environment: TELEGRAM_OWNER_ID = {update.effective_user.id}"
+        await update.message.reply_text(msg)
     if not is_owner(update):
         return
     await update.message.reply_text(HELP.format(timeout=S.get_int("ASK_TIMEOUT")), parse_mode=ParseMode.HTML)
@@ -153,7 +156,11 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     shown = S.mask(value) if secret else (value or "сброшено")
-    await ctx.bot.send_message(update.effective_chat.id, f"✅ {key} = {shown}")
+    note = ""
+    if S.EPHEMERAL:
+        note = ("\n\nℹ️ На Render настройка действует до сна сервера. Чтобы сохранить навсегда, "
+                f"добавь {key} в Render → Environment.")
+    await ctx.bot.send_message(update.effective_chat.id, f"✅ {key} = {shown}{note}")
 
 
 def _is_verified(number: str) -> bool:
@@ -200,8 +207,9 @@ async def cmd_mynumber(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             if await asyncio.to_thread(_is_verified, number):
                 S.set("TWILIO_FROM_NUMBER", number)
+                extra = f"\n\nДобавь в Render → Environment: TWILIO_FROM_NUMBER = {number}" if S.EPHEMERAL else ""
                 await update.message.reply_text(
-                    f"✅ Готово! Номер {number} подтверждён. Теперь у всех, кому звонит бот, высвечивается твой номер."
+                    f"✅ Готово! Номер {number} подтверждён. Теперь у всех, кому звонит бот, высвечивается твой номер.{extra}"
                 )
                 return
         except Exception:

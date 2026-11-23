@@ -73,7 +73,14 @@ def get(key: str) -> str:
     with _lock:
         if key in _overrides and _overrides[key] != "":
             return str(_overrides[key])
-    return os.getenv(key, DEFAULTS.get(key, ("",))[0])
+    val = os.getenv(key) or DEFAULTS.get(key, ("",))[0]
+    if key == "PUBLIC_URL" and not val:
+        val = os.getenv("RENDER_EXTERNAL_URL", "")  # Render сам сообщает свой адрес
+    return val
+
+
+# на Render диск стирается, когда сервер засыпает
+EPHEMERAL = bool(os.getenv("RENDER"))
 
 
 def get_int(key: str) -> int:
