@@ -6,7 +6,14 @@ import re
 import time
 from html import escape
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -40,7 +47,7 @@ HELP = """<b>Бот-звонилка</b> 📞
 <b>Свои настройки</b> (видны только тебе):
 /setup — инструкция по настройке
 /key КЛЮЧ — свой ключ Gemini
-/mynumber +380… — звонить с твоего номера
+/mynumber — звонить с твоего номера (кнопкой)
 /settings — показать настройки
 /set КЛЮЧ значение — поменять (например <code>/set GEMINI_VOICE Kore</code>)
 Сообщения с ключами бот сразу удаляет из чата."""
@@ -247,8 +254,8 @@ def setup_guide(p: Profile) -> str:
         )
     parts.append(
         f"{mark(has_number)} <b>Шаг 3. Звонить с твоего номера</b>\n"
-        "Отправь: <code>/mynumber +380XXXXXXXXX</code>\n"
-        "Twilio позвонит тебе. Возьми трубку и введи код, который пришлёт бот.\n"
+        "Нажми /mynumber, потом кнопку «📱 Отправить мой номер».\n"
+        "Twilio один раз позвонит тебе, введи код из чата, и всё.\n"
     )
     if has_gemini and (has_twilio or shared) and has_number:
         parts.append("🎉 <b>Всё готово!</b> Напиши номер и задачу, например:\n"
@@ -276,7 +283,7 @@ def missing_for_call(p: Profile) -> list[str]:
         "GEMINI_API_KEY": "ключа Gemini (/key КЛЮЧ)",
         "TWILIO_ACCOUNT_SID": "Twilio SID (/set TWILIO_ACCOUNT_SID …)",
         "TWILIO_AUTH_TOKEN": "Twilio токена (/set TWILIO_AUTH_TOKEN …)",
-        "TWILIO_FROM_NUMBER": "номера (/mynumber +380…)",
+        "TWILIO_FROM_NUMBER": "номера (/mynumber)",
     }
     out = [v for k, v in need.items() if not p.get(k)]
     if not S.get("PUBLIC_URL"):
@@ -414,50 +421,97 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def _is_verified(cfg, number: str) -> bool:
-    return bool(twilio_client(cfg).outgoing_caller_ids.list(phone_number=number, limit=1))
+    """Номер можно ставить звонящим, если он подтверждён в Twilio или куплен в Twilio."""
+    c = twilio_client(cfg)
+    return bool(c.outgoing_caller_ids.list(phone_number=number, limit=1)
+                or c.incoming_phone_numbers.list(phone_number=number, limit=1))
 
 
-async def cmd_mynumber(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Привязать свой мобильный: Twilio звонит тебе, ты вводишь код — и бот звонит с твоим номером."""
-    if not await gate(update, ctx):
-        return
-    uid = update.effective_user.id
+def _owned_numbers(cfg) -> list[str]:
+    return [n.phone_number for n in twilio_client(cfg).incoming_phone_numbers.list(limit=5)]
+
+
+CONTACT_KB = ReplyKeyboardMarkup(
+    [[KeyboardButton("📱 Отправить мой номер", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True
+)
+
+
+async def link_number(ctx, chat_id: int, uid: int, number: str) -> None:
+    """Подключить номер: если уже подтверждён — сразу, иначе Twilio один раз позвонит с кодом."""
+    send = lambda text, **k: ctx.bot.send_message(chat_id, text, **k)
     p = await profile(ctx, uid)
     if not (p.get("TWILIO_ACCOUNT_SID") and p.get("TWILIO_AUTH_TOKEN")):
-        await update.message.reply_text("Сначала задай свои TWILIO_ACCOUNT_SID и TWILIO_AUTH_TOKEN через /set.")
+        await send("Сначала задай свои TWILIO_ACCOUNT_SID и TWILIO_AUTH_TOKEN (см. /setup).", reply_markup=ReplyKeyboardRemove())
         return
-    if not ctx.args:
-        cur = p.get("TWILIO_FROM_NUMBER") or "не задан"
-        await update.message.reply_text(f"Сейчас бот звонит с номера: {cur}\n\nЧтобы звонил с твоего: /mynumber +380XXXXXXXXX")
+    try:
+        verified = await asyncio.to_thread(_is_verified, p, number)
+    except Exception as e:
+        await send(f"❌ Не получилось связаться с Twilio: {e}", reply_markup=ReplyKeyboardRemove())
         return
-    number = normalize_number("".join(ctx.args), p.get("DEFAULT_COUNTRY_CODE"))
-    if await asyncio.to_thread(_is_verified, p, number):
+    if verified:
         await set_value(ctx, uid, "TWILIO_FROM_NUMBER", number)
-        await update.message.reply_text(f"✅ Номер {number} уже подтверждён. Теперь бот звонит с него.")
+        await send(f"✅ Номер {number} подключён. Теперь бот звонит с него.", reply_markup=ReplyKeyboardRemove())
+        await _next_step(ctx, chat_id, uid)
         return
     try:
         req = await asyncio.to_thread(
             lambda: twilio_client(p).validation_requests.create(phone_number=number, friendly_name="callbot", call_delay=5)
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Twilio не принял номер: {e}")
+        await send(f"❌ Twilio не принял номер: {e}", reply_markup=ReplyKeyboardRemove())
         return
-    await update.message.reply_text(
-        f"📲 Через несколько секунд Twilio позвонит на {number}.\n"
-        f"Возьми трубку и введи на клавиатуре код: <b>{req.validation_code}</b>\n\nЯ сам проверю, когда номер подтвердится.",
-        parse_mode=ParseMode.HTML,
+    await send(
+        f"📲 Twilio требует один раз подтвердить номер {number}.\n"
+        f"Сейчас он позвонит. Возьми трубку и введи на клавиатуре код: <b>{req.validation_code}</b>\n\n"
+        "Это нужно сделать только один раз, дальше бот будет звонить без этого.",
+        parse_mode=ParseMode.HTML, reply_markup=ReplyKeyboardRemove(),
     )
     for _ in range(36):  # ждём до 3 минут
         await asyncio.sleep(5)
         try:
             if await asyncio.to_thread(_is_verified, p, number):
                 await set_value(ctx, uid, "TWILIO_FROM_NUMBER", number)
-                await update.message.reply_text(f"✅ Готово! Номер {number} подтверждён. Теперь бот звонит с твоего номера.")
-                await _next_step(ctx, update.effective_chat.id, uid)
+                await send(f"✅ Готово! Номер {number} подтверждён. Теперь бот звонит с твоего номера.")
+                await _next_step(ctx, chat_id, uid)
                 return
         except Exception:
             pass
-    await update.message.reply_text("⏱ Подтверждение не пришло. Попробуй ещё раз: /mynumber " + number)
+    await send("⏱ Подтверждение не пришло. Попробуй ещё раз: /mynumber", reply_markup=CONTACT_KB)
+
+
+async def cmd_mynumber(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await gate(update, ctx):
+        return
+    uid = update.effective_user.id
+    p = await profile(ctx, uid)
+    if ctx.args:
+        await link_number(ctx, update.effective_chat.id, uid, normalize_number("".join(ctx.args), p.get("DEFAULT_COUNTRY_CODE")))
+        return
+    cur = p.get("TWILIO_FROM_NUMBER") or "не задан"
+    await update.message.reply_text(
+        f"Сейчас бот звонит с номера: {cur}\n\nНажми кнопку ниже, чтобы бот звонил с твоего номера.",
+        reply_markup=CONTACT_KB,
+    )
+    # вариант без подтверждения: номер, купленный в Twilio
+    try:
+        owned = await asyncio.to_thread(_owned_numbers, p) if p.get("TWILIO_ACCOUNT_SID") else []
+    except Exception:
+        owned = []
+    if owned:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Звонить с {n}", callback_data=f"num|{n}")] for n in owned])
+        await update.message.reply_text("Или звони с номера, купленного в Twilio (подтверждать не нужно):", reply_markup=kb)
+
+
+async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await gate(update, ctx):
+        return
+    c = update.message.contact
+    uid = update.effective_user.id
+    if c.user_id != uid:
+        await update.message.reply_text("Пришли свой контакт кнопкой «📱 Отправить мой номер», а не чужой.", reply_markup=CONTACT_KB)
+        return
+    number = c.phone_number if c.phone_number.startswith("+") else "+" + c.phone_number
+    await link_number(ctx, update.effective_chat.id, uid, number)
 
 
 async def cmd_hangup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -541,6 +595,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await q.answer()
         return
+    if parts[0] == "num":
+        await q.answer()
+        await link_number(ctx, q.message.chat_id, uid, parts[1])
+        return
     call = _find(parts[1])
     if not call or call.user_id != uid:
         await q.answer("Звонок уже завершён")
@@ -580,5 +638,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("hangup", cmd_hangup))
     app.add_handler(CommandHandler("mynumber", cmd_mynumber, block=False))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.CONTACT, on_contact, block=False))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app
