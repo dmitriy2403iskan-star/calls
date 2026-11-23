@@ -36,7 +36,7 @@ async def lifespan(_: FastAPI):
         from telegram import BotCommand
 
         await tg.bot.set_my_commands([
-            BotCommand("start", "Помощь"), BotCommand("key", "Свой ключ Gemini"),
+            BotCommand("start", "Помощь"), BotCommand("setup", "Инструкция по настройке"), BotCommand("key", "Свой ключ Gemini"),
             BotCommand("mynumber", "Звонить с моего номера"), BotCommand("settings", "Мои настройки"),
             BotCommand("hangup", "Положить трубку"),
         ])

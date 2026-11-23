@@ -38,6 +38,7 @@ HELP = """<b>Бот-звонилка</b> 📞
 • /hangup — положить трубку.
 
 <b>Свои настройки</b> (видны только тебе):
+/setup — инструкция по настройке
 /key AIza… — свой ключ Gemini
 /mynumber +380… — звонить с твоего номера
 /settings — показать настройки
@@ -208,11 +209,66 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await gate(update, ctx):
         return
     p = await profile(ctx, uid)
+    if missing_for_call(p):
+        # первым делом — инструкция по настройке
+        await update.message.reply_text(setup_guide(p), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     text = HELP.format(timeout=p.get_int("ASK_TIMEOUT")) + (OWNER_HELP if is_owner(uid) else "")
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    missing = missing_for_call(p)
-    if missing:
-        await update.message.reply_text("⚠️ Чтобы звонить, не хватает: " + ", ".join(missing))
+
+
+def setup_guide(p: Profile) -> str:
+    """Пошаговая инструкция по настройке; выполненные шаги отмечены ✅."""
+    shared = S.get("SHARE_TWILIO") == "1" and not is_owner(p.uid)
+    has_gemini = bool(p.get("GEMINI_API_KEY"))
+    has_twilio = bool(p.get("TWILIO_ACCOUNT_SID") and p.get("TWILIO_AUTH_TOKEN"))
+    has_number = bool(p.get("TWILIO_FROM_NUMBER"))
+    mark = lambda done: "✅" if done else "⬜️"
+
+    parts = ["<b>🛠 Настройка бота — 3 шага</b>\n"]
+    parts.append(
+        f"{mark(has_gemini)} <b>Шаг 1. Ключ Gemini (бесплатно)</b>\n"
+        "1) Открой aistudio.google.com/apikey и войди через Gmail\n"
+        "2) Нажми <b>Create API key</b> и скопируй ключ (начинается с AIza)\n"
+        "3) Отправь сюда: <code>/key AIza…</code>\n"
+    )
+    if shared:
+        parts.append("✅ <b>Шаг 2. Twilio</b> — не нужен, ты звонишь через Twilio владельца.\n")
+    else:
+        parts.append(
+            f"{mark(has_twilio)} <b>Шаг 2. Twilio — через него идут звонки</b>\n"
+            "1) Зарегистрируйся на twilio.com/try-twilio\n"
+            "2) На главной странице Console найди <b>Account SID</b> и <b>Auth Token</b> (нажми Show)\n"
+            "3) Отправь сюда двумя сообщениями:\n"
+            "<code>/set TWILIO_ACCOUNT_SID AC…</code>\n"
+            "<code>/set TWILIO_AUTH_TOKEN …</code>\n"
+            "4) В Console открой Voice → Settings → <b>Geo permissions</b> и включи свою страну (например, Ukraine)\n"
+            "<i>На пробном аккаунте можно звонить только на подтверждённые номера. Чтобы звонить куда угодно, "
+            "пополни баланс (Upgrade). Минуты платные.</i>\n"
+        )
+    parts.append(
+        f"{mark(has_number)} <b>Шаг 3. Звонить с твоего номера</b>\n"
+        "Отправь: <code>/mynumber +380XXXXXXXXX</code>\n"
+        "Twilio позвонит тебе. Возьми трубку и введи код, который пришлёт бот.\n"
+    )
+    if has_gemini and (has_twilio or shared) and has_number:
+        parts.append("🎉 <b>Всё готово!</b> Напиши номер и задачу, например:\n"
+                     "<code>+380671234567 Узнай, работают ли они в воскресенье</code>")
+    else:
+        parts.append("Когда закончишь, снова открой /setup — там будет видно, что ещё осталось.")
+    return "\n".join(parts)
+
+
+async def _next_step(ctx, chat_id: int, uid: int) -> None:
+    """После каждого шага показываем обновлённую инструкцию (пока настройка не закончена или только что закончилась)."""
+    p = await profile(ctx, uid)
+    await ctx.bot.send_message(chat_id, setup_guide(p), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await gate(update, ctx):
+        return
+    p = await profile(ctx, update.effective_user.id)
+    await update.message.reply_text(setup_guide(p), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 def missing_for_call(p: Profile) -> list[str]:
@@ -244,6 +300,7 @@ async def cmd_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.send_message(update.effective_chat.id, "⚠️ Похоже, это не ключ Gemini (он начинается с AIza). Сохраняю как есть.")
     await set_value(ctx, uid, "GEMINI_API_KEY", value)
     await ctx.bot.send_message(update.effective_chat.id, f"✅ Твой ключ Gemini: {S.mask(value) if value else 'удалён'}")
+    await _next_step(ctx, update.effective_chat.id, uid)
 
 
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -273,6 +330,8 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await set_value(ctx, uid, key, value)
     shown = S.mask(value) if key in SECRET_KEYS else (value or "сброшено")
     await ctx.bot.send_message(update.effective_chat.id, f"✅ {key} = {shown}")
+    if key.startswith("TWILIO_"):
+        await _next_step(ctx, update.effective_chat.id, uid)
 
 
 async def cmd_access(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -368,6 +427,7 @@ async def cmd_mynumber(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if await asyncio.to_thread(_is_verified, p, number):
                 await set_value(ctx, uid, "TWILIO_FROM_NUMBER", number)
                 await update.message.reply_text(f"✅ Готово! Номер {number} подтверждён. Теперь бот звонит с твоего номера.")
+                await _next_step(ctx, update.effective_chat.id, uid)
                 return
         except Exception:
             pass
@@ -484,6 +544,7 @@ def build_app() -> Application:
     app = Application.builder().token(S.get("TELEGRAM_BOT_TOKEN")).concurrent_updates(True).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("key", cmd_key))
+    app.add_handler(CommandHandler("setup", cmd_setup))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("access", cmd_access))
