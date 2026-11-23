@@ -249,8 +249,8 @@ def setup_guide(p: Profile) -> str:
             "<code>/set TWILIO_ACCOUNT_SID AC…</code>\n"
             "<code>/set TWILIO_AUTH_TOKEN …</code>\n"
             "4) В Console открой Voice → Settings → <b>Geo permissions</b> и включи свою страну (например, Ukraine)\n"
-            "<i>На пробном аккаунте можно звонить только на подтверждённые номера. Чтобы звонить куда угодно, "
-            "пополни баланс (Upgrade). Минуты платные.</i>\n"
+            "5) <b>Обязательно</b> нажми Upgrade и пополни баланс: на пробном аккаунте Twilio запрещает "
+            "передачу звука в реальном времени, и бот не сможет говорить. Минуты платные.\n"
         )
     parts.append(
         f"{mark(has_number)} <b>Шаг 3. Звонить с твоего номера</b>\n"
@@ -609,7 +609,15 @@ async def start_call(update: Update, ctx: ContextTypes.DEFAULT_TYPE, p: Profile,
     except Exception as e:
         call.status = "failed"
         call.finished = True
-        await update.message.reply_text(f"❌ Twilio не принял звонок: {e}")
+        if "trial" in str(e).lower():
+            await update.message.reply_text(
+                "❌ Twilio не даёт звонить с пробного аккаунта: на нём запрещена передача звука в реальном времени, "
+                "без которой ИИ не может разговаривать.\n\n"
+                "Что делать: в Twilio Console нажми Upgrade и пополни баланс. После этого всё заработает, "
+                "ключи менять не нужно."
+            )
+        else:
+            await update.message.reply_text(f"❌ Twilio не принял звонок: {e}")
 
 
 def _find(prefix: str) -> CallSession | None:
