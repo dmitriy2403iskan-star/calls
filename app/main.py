@@ -1,4 +1,5 @@
 """Сервер: принимает аудиопоток звонка от Twilio и параллельно крутит Telegram-бота."""
+import asyncio
 import hashlib
 import logging
 import os
@@ -24,6 +25,22 @@ def webhook_secret() -> str:
     return hashlib.sha256(("tg-hook:" + S.get("TELEGRAM_BOT_TOKEN")).encode()).hexdigest()[:40]
 
 
+async def keep_awake():
+    """Render усыпляет бесплатный сервер через 15 минут без входящих запросов.
+    Пингуем свой публичный адрес каждые 10 минут, чтобы бот отвечал сразу
+    (750 бесплатных часов в месяц хватает на круглосуточную работу одного сервиса)."""
+    import httpx
+
+    url = S.get("PUBLIC_URL").rstrip("/") + "/health"
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            await asyncio.sleep(600)
+            try:
+                await client.get(url)
+            except Exception as e:
+                logging.info("keep-alive ping failed: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     tg = build_app()
@@ -43,6 +60,9 @@ async def lifespan(_: FastAPI):
     except Exception:
         pass
     await tg.start()
+    keepalive = None
+    if os.getenv("RENDER") and S.get("PUBLIC_URL"):
+        keepalive = asyncio.create_task(keep_awake())
     if WEBHOOK:
         # Cloudflare: Telegram сам будит контейнер, присылая сообщения на адрес Worker'а
         url = S.get("PUBLIC_URL").rstrip("/") + "/tg/" + webhook_secret()
@@ -52,6 +72,8 @@ async def lifespan(_: FastAPI):
         await tg.updater.start_polling(drop_pending_updates=True)
         logging.info("Telegram-бот запущен (polling)")
     yield
+    if keepalive:
+        keepalive.cancel()
     if not WEBHOOK:
         await tg.updater.stop()
     await tg.stop()

@@ -228,7 +228,7 @@ def setup_guide(p: Profile) -> str:
     shared = S.get("SHARE_TWILIO") == "1" and not is_owner(p.uid)
     has_gemini = bool(p.get("GEMINI_API_KEY"))
     has_twilio = bool(p.get("TWILIO_ACCOUNT_SID") and p.get("TWILIO_AUTH_TOKEN"))
-    has_number = bool(p.get("TWILIO_FROM_NUMBER"))
+    has_number = bool(re.fullmatch(r"\+\d{9,15}", p.get("TWILIO_FROM_NUMBER") or ""))
     mark = lambda done: "✅" if done else "⬜️"
 
     parts = ["<b>🛠 Настройка бота — 3 шага</b>\n"]
@@ -286,9 +286,39 @@ def missing_for_call(p: Profile) -> list[str]:
         "TWILIO_FROM_NUMBER": "номера (/mynumber)",
     }
     out = [v for k, v in need.items() if not p.get(k)]
+    num = p.get("TWILIO_FROM_NUMBER")
+    if num and not re.fullmatch(r"\+\d{9,15}", num):
+        out.append(f"правильного номера: сейчас там «{num[:8]}…», а не номер телефона (/mynumber)")
     if not S.get("PUBLIC_URL"):
         out.append("PUBLIC_URL сервера (настраивает владелец)")
     return out
+
+
+def fix_value(key: str, value: str) -> tuple[str, str, str]:
+    """Проверить значение. Если явно перепутан ключ (SID в поле номера и т.п.) — исправить.
+    Возвращает (ключ, значение, текст ошибки или "")."""
+    v = value.strip()
+    if not v:
+        return key, v, ""
+    looks_sid = bool(re.fullmatch(r"AC[0-9a-fA-F]{32}", v))
+    looks_token = bool(re.fullmatch(r"[0-9a-fA-F]{32}", v))
+    looks_phone = bool(re.fullmatch(r"\+?[\d\s\-()]{9,}", v))
+    if key.startswith("TWILIO_"):
+        if looks_sid:
+            return "TWILIO_ACCOUNT_SID", v, ""
+        if looks_token:
+            return "TWILIO_AUTH_TOKEN", v, ""
+        if key == "TWILIO_FROM_NUMBER" and looks_phone:
+            return key, normalize_number(v), ""
+        hints = {
+            "TWILIO_ACCOUNT_SID": "Account SID начинается с AC и состоит из 34 символов. Он есть на главной странице Twilio Console.",
+            "TWILIO_AUTH_TOKEN": "Auth Token — это 32 символа (цифры и буквы a–f). Он на главной странице Twilio Console, кнопка Show.",
+            "TWILIO_FROM_NUMBER": "Номер нужен в формате +380XXXXXXXXX. Проще всего: /mynumber и кнопка «📱 Отправить мой номер».",
+        }
+        return key, v, "⚠️ Это не похоже на нужное значение. " + hints.get(key, "")
+    if key in ("ASK_TIMEOUT", "MAX_CALL_SECONDS") and not v.isdigit():
+        return key, v, "⚠️ Здесь нужно число секунд."
+    return key, v, ""
 
 
 async def check_gemini_key(key: str) -> tuple[bool | None, str]:
@@ -358,8 +388,15 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if key not in allowed_keys:
         await update.message.reply_text("Такой ключ тебе менять нельзя. Список — /settings")
         return
-    if key in SECRET_KEYS:
+    if key in SECRET_KEYS or key.startswith("TWILIO_"):
         await _delete(update)
+    asked_key = key
+    key, value, problem = fix_value(key, value)
+    if key != asked_key:
+        await ctx.bot.send_message(update.effective_chat.id, f"ℹ️ Это значение для {key}, а не для {asked_key}. Сохранил куда нужно.")
+    if problem:
+        await ctx.bot.send_message(update.effective_chat.id, problem)
+        return
     await set_value(ctx, uid, key, value)
     shown = S.mask(value) if key in SECRET_KEYS else (value or "сброшено")
     await ctx.bot.send_message(update.effective_chat.id, f"✅ {key} = {shown}")
