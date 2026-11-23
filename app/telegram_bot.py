@@ -26,7 +26,7 @@ log = logging.getLogger("tg")
 HELP = """<b>Бот-звонилка</b> 📞
 
 <b>1. Задай свой ключ Gemini</b> (бесплатно на aistudio.google.com/apikey):
-<code>/key AIza…</code>
+<code>/key ТВОЙ_КЛЮЧ</code>
 
 <b>2. Звонок</b> — номер и задача одним сообщением:
 <code>+380671234567 Забронируй столик на двоих на завтра на 19:00 на имя Алексей. Лучше у окна.</code>
@@ -39,7 +39,7 @@ HELP = """<b>Бот-звонилка</b> 📞
 
 <b>Свои настройки</b> (видны только тебе):
 /setup — инструкция по настройке
-/key AIza… — свой ключ Gemini
+/key КЛЮЧ — свой ключ Gemini
 /mynumber +380… — звонить с твоего номера
 /settings — показать настройки
 /set КЛЮЧ значение — поменять (например <code>/set GEMINI_VOICE Kore</code>)
@@ -228,8 +228,8 @@ def setup_guide(p: Profile) -> str:
     parts.append(
         f"{mark(has_gemini)} <b>Шаг 1. Ключ Gemini (бесплатно)</b>\n"
         "1) Открой aistudio.google.com/apikey и войди через Gmail\n"
-        "2) Нажми <b>Create API key</b> и скопируй ключ (начинается с AIza)\n"
-        "3) Отправь сюда: <code>/key AIza…</code>\n"
+        "2) Нажми <b>Create API key</b> и скопируй ключ (обычно начинается с AQ. или AIza)\n"
+        "3) Отправь сюда: <code>/key ТВОЙ_КЛЮЧ</code>\n"
     )
     if shared:
         parts.append("✅ <b>Шаг 2. Twilio</b> — не нужен, ты звонишь через Twilio владельца.\n")
@@ -273,7 +273,7 @@ async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def missing_for_call(p: Profile) -> list[str]:
     need = {
-        "GEMINI_API_KEY": "ключа Gemini (/key AIza…)",
+        "GEMINI_API_KEY": "ключа Gemini (/key КЛЮЧ)",
         "TWILIO_ACCOUNT_SID": "Twilio SID (/set TWILIO_ACCOUNT_SID …)",
         "TWILIO_AUTH_TOKEN": "Twilio токена (/set TWILIO_AUTH_TOKEN …)",
         "TWILIO_FROM_NUMBER": "номера (/mynumber +380…)",
@@ -284,6 +284,26 @@ def missing_for_call(p: Profile) -> list[str]:
     return out
 
 
+async def check_gemini_key(key: str) -> tuple[bool | None, str]:
+    """True — ключ рабочий, False — Google его отверг, None — проверить не удалось.
+    Подходят и новые ключи AQ.…, и старые AIza…"""
+    from google import genai
+
+    try:
+        client = genai.Client(api_key=key)
+        pager = await asyncio.wait_for(client.aio.models.list(config={"page_size": 1}), 15)
+        async for _ in pager:
+            break
+        return True, ""
+    except asyncio.TimeoutError:
+        return None, "timeout"
+    except Exception as e:
+        code = getattr(e, "code", None) or getattr(e, "status_code", None)
+        text = str(e)
+        bad_key = code == 401 or any(m in text for m in ("API_KEY_INVALID", "API key not valid", "UNAUTHENTICATED"))
+        return (False if bad_key else None), text[:200]
+
+
 async def cmd_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await gate(update, ctx):
         return
@@ -291,15 +311,21 @@ async def cmd_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         p = await profile(ctx, uid)
         await update.message.reply_text(
-            f"Твой ключ Gemini: {S.mask(p.get('GEMINI_API_KEY'))}\n\nПоменять: /key AIza…\nУдалить: /key -",
+            f"Твой ключ Gemini: {S.mask(p.get('GEMINI_API_KEY'))}\n\nПоменять: /key КЛЮЧ\nУдалить: /key -",
         )
         return
     value = "" if ctx.args[0] == "-" else ctx.args[0].strip()
     await _delete(update)
-    if value and not value.startswith("AIza"):
-        await ctx.bot.send_message(update.effective_chat.id, "⚠️ Похоже, это не ключ Gemini (он начинается с AIza). Сохраняю как есть.")
+    chat = update.effective_chat.id
+    if value:
+        ok, why = await check_gemini_key(value)
+        if ok is False:
+            await ctx.bot.send_message(chat, f"❌ Google не принял этот ключ: {escape(why)}\nПроверь, что скопировал его целиком, или создай новый на aistudio.google.com/apikey", parse_mode=ParseMode.HTML)
+            return
+        if ok is None:
+            await ctx.bot.send_message(chat, f"⚠️ Не получилось проверить ключ, сохраняю как есть. Ответ Google: {escape(why)}", parse_mode=ParseMode.HTML)
     await set_value(ctx, uid, "GEMINI_API_KEY", value)
-    await ctx.bot.send_message(update.effective_chat.id, f"✅ Твой ключ Gemini: {S.mask(value) if value else 'удалён'}")
+    await ctx.bot.send_message(chat, f"✅ Твой ключ Gemini работает и сохранён: {S.mask(value)}" if value else "✅ Ключ Gemini удалён")
     await _next_step(ctx, update.effective_chat.id, uid)
 
 
